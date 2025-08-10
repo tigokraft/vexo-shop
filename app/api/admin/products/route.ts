@@ -55,29 +55,41 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   const { user, error } = await requireAdminUser();
   if (error) return error;
+
   const body = await req.json().catch(() => null);
   const parsed = createSchema.safeParse(body);
   if (!parsed.success) return badRequest('Invalid payload', parsed.error.format());
+
   const { title, slug, description, brandId, status, categoryIds, images, skuPrefix } = parsed.data;
+  const normalizedSlug = slug ? slugify(slug) : slugify(title);
 
   try {
+    // 1) Fast path: if exists, just return it (200)
+    const existing = await prisma.product.findUnique({ where: { slug: normalizedSlug } });
+    if (existing) return ok(existing); // <- no 409s in dev
+
+    // 2) Create new
     const created = await prisma.product.create({
       data: {
         title,
-        slug: slug ? slugify(slug) : slugify(title),
+        slug: normalizedSlug,
         description,
         brandId: brandId ?? null,
         status: status ?? 'DRAFT',
         skuPrefix: skuPrefix ?? title.split(/\s+/).map(s => s[0]).join('').toUpperCase(),
         categories: categoryIds?.length ? { create: categoryIds.map(id => ({ categoryId: id })) } : undefined,
-        images: images?.length ? { create: images.map(img => ({ ...img, position: img.position ?? 0 })) } : undefined,
+        images: images?.length ? { create: images.map((img, i) => ({ ...img, position: img.position ?? i })) } : undefined,
       },
     });
 
     await audit({ actorUserId: user.id, action: 'product.create', entityType: 'Product', entityId: created.id, after: created });
     return ok(created, { status: 201 });
   } catch (e: any) {
-    if (e?.code === 'P2002') return conflict('Slug already exists');
+    // Fallback in case of a rare race: if it still hit P2002, return the existing row
+    if (e?.code === 'P2002') {
+      const row = await prisma.product.findUnique({ where: { slug: normalizedSlug } });
+      if (row) return ok(row);
+    }
     return serverError('Failed to create product', e);
   }
 }
