@@ -1,120 +1,110 @@
 import { badRequest, ok, serverError } from '@/lib/http';
-import { getOrCreateCart, computeTotals, reserveStock } from '@/lib/cart';
+import { getOrCreateCart, computeTotals } from '@/lib/cart';
 import { getCurrentUser } from '@/lib/auth';
+import { getDefaultWarehouseId } from '@/lib/warehouse';
 import { prisma } from '@/lib/prisma';
 import { z } from 'zod';
 
 export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 const bodySchema = z.object({
-  email: z.string().email().optional(), // if not logged in
-  payment: z.object({
-    provider: z.literal('manual'),
-    capture: z.boolean().default(true),
-  }).default({ provider: 'manual', capture: true }),
-  shippingAddressId: z.string().uuid().optional(),
-  billingAddressId: z.string().uuid().optional(),
+  email: z.string().email().optional(),
 });
 
 export async function POST(req: Request) {
-  const user = await getCurrentUser();
-  const payload = await req.json().catch(() => null);
-  const parsed = bodySchema.safeParse(payload);
+  const body = await req.json().catch(() => ({}));
+  const parsed = bodySchema.safeParse(body);
   if (!parsed.success) return badRequest('Invalid payload', parsed.error.format());
 
   try {
+    const user = await getCurrentUser();
     const cart = await getOrCreateCart();
-    if (cart.items.length === 0) return badRequest('Cart is empty');
-
-    const email = user?.email ?? parsed.data.email;
-    if (!email) return badRequest('Email required');
-
-    // Final availability check
-    for (const it of cart.items) {
-      const v = await prisma.productVariant.findUnique({ where: { id: it.variantId }, include: { stockLevels: true } });
-      if (!v) return badRequest(`Variant ${it.variantId} missing`);
-      const available = v.stockLevels.reduce((acc, s) => acc + (s.onHand - s.reserved), 0);
-      if (v.trackInventory && it.quantity > available) {
-        return badRequest(`Insufficient stock for ${v.sku}`);
-      }
-    }
+    if (!cart.items.length) return badRequest('Cart is empty');
 
     const totals = await computeTotals(cart);
+    const email = parsed.data.email ?? user?.email ?? 'buyer@local.test';
+    const whId = await getDefaultWarehouseId();
 
     const order = await prisma.$transaction(async (tx) => {
-      // Create order
+      // 1) Create order + items (nested)
       const o = await tx.order.create({
         data: {
-          userId: user?.id ?? null,
+          ...(user ? { user: { connect: { id: user.id } } } : {}),
           email,
-          currency: totals.currency,
+          currency: cart.currency,
           subtotalCents: totals.subtotal,
           discountCents: totals.discount,
           shippingCents: totals.shipping,
           taxCents: totals.tax,
           totalCents: totals.total,
-          status: 'PAID', // manual provider
-          couponId: cart.couponId ?? null,
-          shippingAddressId: parsed.data.shippingAddressId ?? null,
-          billingAddressId: parsed.data.billingAddressId ?? null,
+          status: 'PAID',
+          items: {
+            create: cart.items.map((it: any) => {
+              const unit = Number(it.priceCents ?? it.variant?.priceCents ?? 0);
+              const qty = Number(it.quantity ?? 0);
+              return {
+                variantId: it.variantId,
+                sku: it.sku ?? it.variant?.sku ?? '',
+                title: it.title ?? it.variant?.title ?? '',
+                quantity: qty,
+                priceCents: unit,
+                totalCents: unit * qty,   // ← REQUIRED by your schema
+                currency: cart.currency,
+              };
+            }),
+          },
         },
+        include: { items: true },
       });
 
-      // Items
+      // 2) Stock: consume reserved -> onHand, and release reservation
       for (const it of cart.items) {
-        const v = await tx.productVariant.findUnique({
-          where: { id: it.variantId },
-          include: { product: true },
+        const key = { variantId_warehouseId: { variantId: it.variantId, warehouseId: whId } };
+        const level = await tx.stockLevel.upsert({
+          where: key,
+          update: {},
+          create: { variantId: it.variantId, warehouseId: whId, onHand: 0, reserved: 0 },
         });
-        if (!v) throw new Error('Variant vanished during checkout');
-        await tx.orderItem.create({
+
+        const qty = it.quantity;
+        const newReserved = Math.max(0, level.reserved - qty);
+        const newOnHand = Math.max(0, level.onHand - qty);
+
+        await tx.stockLevel.update({ where: key, data: { reserved: newReserved, onHand: newOnHand } });
+        await tx.stockMovement.create({
           data: {
-            orderId: o.id,
-            variantId: v.id,
-            sku: v.sku,
-            title: v.title,
-            priceCents: v.priceCents,
-            currency: v.currency,
-            quantity: it.quantity,
+            variantId: it.variantId,
+            warehouseId: whId,
+            type: 'ADJUSTMENT',
+            delta: -qty,
+            reason: 'order_paid',
           },
         });
       }
 
-      // Reduce onHand and release reserved
-      for (const it of cart.items) {
-        // Reserve was already held; convert reserved -> onHand reduction
-        await commitStockForCheckout(tx, it.variantId, it.quantity);
-      }
-
-      // Clear cart
+      // 3) Clear cart
       await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
-      await tx.cart.update({ where: { id: cart.id }, data: { couponId: null } });
-
       return o;
     });
 
-    return ok({ orderId: order.id, status: order.status, totalCents: totals.total });
+    return ok({
+      order: {
+        id: order.id,
+        currency: cart.currency,
+        totalCents: totals.total,
+        items: order.items.map((i: any) => ({
+          id: i.id,
+          variantId: i.variantId,
+          sku: i.sku,
+          title: i.title,
+          quantity: i.quantity,
+          priceCents: i.priceCents,
+          totalCents: i.totalCents,
+        })),
+      },
+    });
   } catch (e: any) {
     return serverError('Checkout failed', e);
   }
-}
-
-// helper: adjust per default warehouse
-async function commitStockForCheckout(tx: any, variantId: string, qty: number) {
-  const { getDefaultWarehouseId } = await import('@/lib/warehouse');
-  const wh = await getDefaultWarehouseId();
-  const level = await tx.stockLevel.upsert({
-    where: { variantId_warehouseId: { variantId, warehouseId: wh } },
-    update: {},
-    create: { variantId, warehouseId: wh, onHand: 0, reserved: 0 },
-  });
-  const newReserved = Math.max(0, level.reserved - qty);
-  const newOnHand = Math.max(0, level.onHand - qty);
-  await tx.stockLevel.update({
-    where: { variantId_warehouseId: { variantId, warehouseId: wh } },
-    data: { onHand: newOnHand, reserved: newReserved },
-  });
-  await tx.stockMovement.create({
-    data: { variantId, warehouseId: wh, type: 'ADJUSTMENT', delta: -qty, reason: 'checkout_commit' },
-  });
 }

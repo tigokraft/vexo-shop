@@ -19,8 +19,11 @@ export async function POST(req: Request) {
     const cart = await getOrCreateCart();
     const { variantId, quantity } = parsed.data;
 
+    // How many we’ll have after this add
     const existing = cart.items.find((i) => i.variantId === variantId);
     const need = (existing?.quantity ?? 0) + quantity;
+
+    // Stock check
     const avail = await ensureAvailability(variantId, need);
     if (!avail.ok) return badRequest(avail.reason);
 
@@ -34,23 +37,25 @@ export async function POST(req: Request) {
           data: { quantity: existing.quantity + quantity },
         });
       } else {
+        // currency: prefer variant.currency, then cart.currency, finally EUR
+        const itemCurrency = (variant as any).currency ?? (cart as any).currency ?? 'EUR';
+
         await tx.cartItem.create({
           data: {
             cartId: cart.id,
             variantId,
             quantity,
-            // snapshots required by your schema:
-            priceCentsAtAdd: variant.priceCents,
-            priceCents: variant.priceCents,    // ✅ add this
-            sku: variant.sku,                  // ✅ already added before
-            title: variant.title,              // ✅ already added before
-            // if your schema has currency on CartItem, set it too:
-            // currency: variant.currency ?? cart.currency,
+            // REQUIRED by your CartItem schema:
+            priceCents: variant.priceCents,
+            sku: variant.sku,
+            title: variant.title ?? '',
+            currency: itemCurrency,
           },
         });
       }
     });
 
+    // reserve stock
     await reserveStock(variantId, quantity);
 
     const fresh = await getOrCreateCart();

@@ -1,64 +1,62 @@
-import { badRequest, ok, serverError } from '@/lib/http';
-import { getOrCreateCart, ensureAvailability, reserveStock } from '@/lib/cart';
-import { z } from 'zod';
+import { ok, serverError } from '@/lib/http';
+import { getOrCreateCart, computeTotals, reserveStock } from '@/lib/cart';
 import { prisma } from '@/lib/prisma';
 
 export const runtime = 'nodejs';
+// optional but avoids cache shenanigans for carts:
+export const dynamic = 'force-dynamic';
 
-const bodySchema = z.object({
-  variantId: z.string().uuid(),
-  quantity: z.number().int().min(1).max(999).default(1),
-});
-
-export async function POST(req: Request) {
-  const body = await req.json().catch(() => null);
-  const parsed = bodySchema.safeParse(body);
-  if (!parsed.success) return badRequest('Invalid payload', parsed.error.format());
-
+export async function GET() {
   try {
     const cart = await getOrCreateCart();
-    const { variantId, quantity } = parsed.data;
-
-    const existing = cart.items.find((i) => i.variantId === variantId);
-    const need = (existing?.quantity ?? 0) + quantity;
-    const avail = await ensureAvailability(variantId, need);
-    if (!avail.ok) return badRequest(avail.reason);
-
-    await prisma.$transaction(async (tx) => {
-      const variant = await tx.productVariant.findUnique({ where: { id: variantId } });
-      if (!variant) throw new Error('Variant missing');
-
-      if (existing) {
-        await tx.cartItem.update({
-          where: { id: existing.id },
-          data: { quantity: existing.quantity + quantity },
-        });
-      } else {
-        const itemCurrency =
-          (variant as any).currency ??
-          (cart as any).currency ??
-          'EUR';
-
-        await tx.cartItem.create({
-          data: {
-            cartId: cart.id,
-            variantId,
-            quantity,
-            priceCentsAtAdd: variant.priceCents,
-            priceCents: variant.priceCents,
-            sku: variant.sku,
-            title: variant.title,
-            currency: itemCurrency, // ✅ REQUIRED
-          },
-        });
-      }
-    });
-
-    await reserveStock(variantId, quantity);
-
-    const fresh = await getOrCreateCart();
-    return ok({ cartId: fresh.id, items: fresh.items.length });
+    const totals = await computeTotals(cart);
+    return ok({ cart: shape(cart), totals });
   } catch (e: any) {
-    return serverError('Failed to add item', e);
+    return serverError('Failed to load cart', e);
   }
+}
+
+export async function DELETE() {
+  try {
+    const cart = await getOrCreateCart();
+    // release reserved stock
+    for (const it of cart.items) {
+      await reserveStock(it.variantId, -it.quantity);
+    }
+    await prisma.cartItem.deleteMany({ where: { cartId: cart.id } });
+    const fresh = await getOrCreateCart(); // return empty cart
+    const totals = await computeTotals(fresh);
+    return ok({ cart: shape(fresh), totals });
+  } catch (e: any) {
+    return serverError('Failed to clear cart', e);
+  }
+}
+
+/* ---------------- helpers ---------------- */
+
+function shape(cart: NonNullable<Awaited<ReturnType<typeof getOrCreateCart>>>) {
+  return {
+    id: cart.id,
+    currency: cart.currency,
+    coupon: cart.coupon
+      ? { id: (cart.coupon as any).id, code: (cart.coupon as any).code ?? null }
+      : null,
+    items: cart.items.map((it: any) => ({
+      id: it.id,
+      variantId: it.variantId,
+      quantity: it.quantity,
+      // prefer snapshot stored on CartItem; fall back to live variant
+      unitPriceCents: it.priceCents ?? it.variant?.priceCents ?? 0,
+      title: it.title ?? it.variant?.title ?? '',
+      sku: it.sku ?? it.variant?.sku ?? '',
+      product: it.variant?.product
+        ? {
+            id: it.variant.product.id,
+            title: it.variant.product.title,
+            slug: it.variant.product.slug,
+            image: it.variant.product.images?.[0]?.url ?? null,
+          }
+        : null,
+    })),
+  };
 }
