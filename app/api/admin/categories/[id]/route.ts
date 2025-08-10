@@ -11,15 +11,17 @@ const updateSchema = z.object({
   name: z.string().min(2).max(120).optional(),
   slug: z.string().min(2).max(140).optional(),
   description: z.string().max(2000).nullable().optional(),
-  website: z.string().url().nullable().optional(),
-  logoUrl: z.string().url().nullable().optional(),
+  parentId: z.string().uuid().nullable().optional(),
 });
 
 export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  const brand = await prisma.brand.findUnique({ where: { id } });
-  if (!brand) return notFound('Brand not found');
-  return ok(brand);
+  const category = await prisma.category.findUnique({
+    where: { id },
+    include: { parent: true, children: true },
+  });
+  if (!category) return notFound('Category not found');
+  return ok(category);
 }
 
 export async function PUT(req: Request, ctx: { params: Promise<{ id: string }> }) {
@@ -32,26 +34,28 @@ export async function PUT(req: Request, ctx: { params: Promise<{ id: string }> }
 
   const { id } = await ctx.params;
 
-  const existing = await prisma.brand.findUnique({ where: { id } });
-  if (!existing) return notFound('Brand not found');
+  const existing = await prisma.category.findUnique({ where: { id } });
+  if (!existing) return notFound('Category not found');
 
   const data: any = { ...parsed.data };
   if (data.slug) data.slug = slugify(data.slug);
 
+  if (data.parentId === id) return badRequest('A category cannot be its own parent');
+
   try {
-    const updated = await prisma.brand.update({ where: { id }, data });
+    const updated = await prisma.category.update({ where: { id }, data });
     await audit({
       actorUserId: user.id,
-      action: 'brand.update',
-      entityType: 'Brand',
+      action: 'category.update',
+      entityType: 'Category',
       entityId: updated.id,
       before: existing,
       after: updated,
     });
     return ok(updated);
   } catch (e: any) {
-    if (e?.code === 'P2002') return conflict('Name or slug already exists');
-    return serverError('Failed to update brand', e);
+    if (e?.code === 'P2002') return conflict('Slug already exists or name clashes among siblings');
+    return serverError('Failed to update category', e);
   }
 }
 
@@ -61,20 +65,20 @@ export async function DELETE(_req: Request, ctx: { params: Promise<{ id: string 
 
   const { id } = await ctx.params;
 
-  const existing = await prisma.brand.findUnique({ where: { id } });
-  if (!existing) return notFound('Brand not found');
+  const existing = await prisma.category.findUnique({ where: { id } });
+  if (!existing) return notFound('Category not found');
 
   try {
-    const deleted = await prisma.brand.delete({ where: { id } });
+    const deleted = await prisma.category.delete({ where: { id } });
     await audit({
       actorUserId: user.id,
-      action: 'brand.delete',
-      entityType: 'Brand',
+      action: 'category.delete',
+      entityType: 'Category',
       entityId: deleted.id,
       before: existing,
     });
     return ok({ ok: true });
   } catch (e: any) {
-    return serverError('Failed to delete brand', e);
+    return serverError('Failed to delete category', e);
   }
 }
