@@ -19,7 +19,6 @@ export async function POST(req: Request) {
     const cart = await getOrCreateCart();
     const { variantId, quantity } = parsed.data;
 
-    // availability vs current quantity in cart
     const existing = cart.items.find((i) => i.variantId === variantId);
     const need = (existing?.quantity ?? 0) + quantity;
     const avail = await ensureAvailability(variantId, need);
@@ -40,9 +39,13 @@ export async function POST(req: Request) {
             cartId: cart.id,
             variantId,
             quantity,
+            // snapshots required by your schema:
             priceCentsAtAdd: variant.priceCents,
-            sku: variant.sku,       // required by schema
-            title: variant.title,   // required by schema
+            priceCents: variant.priceCents,    // ✅ add this
+            sku: variant.sku,                  // ✅ already added before
+            title: variant.title,              // ✅ already added before
+            // if your schema has currency on CartItem, set it too:
+            // currency: variant.currency ?? cart.currency,
           },
         });
       }

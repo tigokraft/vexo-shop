@@ -49,10 +49,8 @@ export async function getOrCreateCart() {
   const cookieId = ck.get(CART_COOKIE)?.value ?? null;
   const user = await getCurrentUser();
 
-  // Try cookie cart
   let cart = await loadCartRaw(cookieId);
 
-  // If logged in, reconcile with user cart
   if (user) {
     const userCart = await prisma.cart.findFirst({
       where: { userId: user.id },
@@ -72,14 +70,10 @@ export async function getOrCreateCart() {
 
   if (!cart) {
     cart = await prisma.cart.create({
-      data: {
-        userId: user?.id ?? null,
-        currency: 'EUR',
-      },
+      data: { userId: user?.id ?? null, currency: 'EUR' },
     });
   }
 
-  // Set/refresh cookie
   ck.set(CART_COOKIE, cart.id, {
     httpOnly: true,
     sameSite: 'lax',
@@ -91,13 +85,13 @@ export async function getOrCreateCart() {
 }
 
 export async function mergeCarts(targetCartId: string, fromCartId: string) {
-  const from = await prisma.cart.findUnique({
-    where: { id: fromCartId },
-    include: { items: true },
-  });
+  const [from, target] = await Promise.all([
+    prisma.cart.findUnique({ where: { id: fromCartId }, include: { items: true } }),
+    prisma.cart.findUnique({ where: { id: targetCartId }, select: { currency: true } }),
+  ]);
   if (!from) return;
 
-  for (const it of from.items) {
+  for (const it of from.items as any[]) {
     const existing = await prisma.cartItem.findFirst({
       where: { cartId: targetCartId, variantId: it.variantId },
     });
@@ -112,9 +106,11 @@ export async function mergeCarts(targetCartId: string, fromCartId: string) {
           cartId: targetCartId,
           variantId: it.variantId,
           quantity: it.quantity,
-          priceCentsAtAdd: it.priceCentsAtAdd,
-          sku: it.sku,       // preserve snapshot
-          title: it.title,   // preserve snapshot
+          priceCentsAtAdd: it.priceCentsAtAdd ?? it.priceCents ?? 0,
+          priceCents: it.priceCents ?? it.priceCentsAtAdd ?? 0,
+          sku: it.sku,
+          title: it.title,
+          currency: it.currency ?? target?.currency ?? 'EUR', // ✅ keep currency
         },
       });
     }
@@ -122,14 +118,15 @@ export async function mergeCarts(targetCartId: string, fromCartId: string) {
 }
 
 export async function computeTotals(cart: NonNullable<CartWithItems>) {
-  // Subtotal from live price (fallback to snapshot)
   let subtotal = 0;
-  for (const it of cart.items) {
-    const unit = cents(it.variant?.priceCents ?? it.priceCentsAtAdd);
+  for (const it of cart.items as any[]) {
+    const unit =
+      cents(it.priceCents) ||
+      cents(it.variant?.priceCents) ||
+      cents(it.priceCentsAtAdd);
     subtotal += unit * it.quantity;
   }
 
-  // Coupon (simple FIXED/PERCENT)
   let discount = 0;
   if (cart.coupon) {
     const c: any = cart.coupon;
@@ -139,8 +136,8 @@ export async function computeTotals(cart: NonNullable<CartWithItems>) {
     else discount = Math.min(subtotal, cents(value));
   }
 
-  const shipping = 0; // MVP
-  const tax = 0;      // MVP
+  const shipping = 0;
+  const tax = 0;
   const total = Math.max(0, subtotal - discount + shipping + tax);
 
   return { currency: cart.currency, subtotal, discount, shipping, tax, total };
@@ -153,7 +150,6 @@ export async function ensureAvailability(variantId: string, needQty: number) {
   });
   if (!v) return { ok: false as const, reason: 'Variant not found' };
 
-  // available = sum(onHand - reserved)
   const available = v.stockLevels.reduce((acc, s) => acc + (s.onHand - s.reserved), 0);
   if (v.trackInventory && needQty > available) {
     return { ok: false as const, reason: `Insufficient stock: need ${needQty}, available ${available}` };
