@@ -2,39 +2,54 @@
 """
 Full API CLI for your Next.js + Prisma store.
 
-Requirements:
+Requires:
   pip install requests
 
+ENV (optional):
+  STORE_BASE_URL (default http://localhost:3000)
+  STORE_ADMIN_EMAIL (default admin@local.test)
+  STORE_ADMIN_PASSWORD (default admin123!)
+
 Quick samples:
-  # login (stores cookie if --cookie-file is set)
-  python store_cli.py --cookie-file session.cookies login --email admin@local.test --password admin123!
 
-  # brands
-  python store_cli.py --cookie-file session.cookies brands list
-  python store_cli.py --cookie-file session.cookies brands create --name Orbit --slug orbit
+# login (stores cookie if --cookie-file is set)
+python store_cli.py --cookie-file admin.cookies login --email admin@local.test --password admin123!
 
-  # products + options + variants
-  python store_cli.py --cookie-file session.cookies products create --title "Athletic Tee" --slug athletic-tee --sku-prefix TEE
-  python store_cli.py --cookie-file session.cookies options add --product-id PRODUCT_ID --name Size --values S M L
-  python store_cli.py --cookie-file session.cookies options add --product-id PRODUCT_ID --name Color --values Black White
-  python store_cli.py --cookie-file session.cookies variants generate --product-id PRODUCT_ID --price-cents 2499 --stock 25
+# brands
+python store_cli.py --cookie-file admin.cookies brands list
+python store_cli.py --cookie-file admin.cookies brands create --name Orbit --slug orbit
 
-  # catalog (public)
-  python store_cli.py catalog products --page 1 --page-size 24
-  python store_cli.py catalog product --slug athletic-tee
+# products + options + variants
+python store_cli.py --cookie-file admin.cookies products create --title "Athletic Tee" --slug athletic-tee --sku-prefix TEE --status PUBLISHED --image https://picsum.photos/seed/athtee/800/800
+python store_cli.py --cookie-file admin.cookies options add --product-id PRODUCT_ID --name Size --values S M L
+python store_cli.py --cookie-file admin.cookies options add --product-id PRODUCT_ID --name Color --values Black White
+python store_cli.py --cookie-file admin.cookies variants generate --product-id PRODUCT_ID --price-cents 2499 --stock 25
 
-  # cart -> add item -> checkout (guest)
-  python store_cli.py --cookie-file cart.cookies cart add --variant-id VARIANT_ID --qty 2
-  python store_cli.py --cookie-file cart.cookies checkout --email buyer@local.test
+# catalog (public)
+python store_cli.py catalog products --page 1 --page-size 24
+python store_cli.py catalog product --slug athletic-tee
 
-  # end-to-end demos
-  python store_cli.py --cookie-file admin.cookies demo-admin
-  python store_cli.py --cookie-file cart.cookies demo-storefront
+# cart -> add item -> checkout (guest)
+python store_cli.py --cookie-file cart.cookies cart add --variant-id VARIANT_ID --qty 2
+python store_cli.py --cookie-file cart.cookies checkout --email buyer@local.test
 
-  # full smoke flow (guest->reserve->login merge->checkout + optional stock checks)
-  python store_cli.py --cookie-file cart.cookies smoke --slug athletic-tee --qty 2 \
-    --user-email user@local.test --user-password test12345 \
-    --admin-cookie-file admin.cookies --admin-email admin@local.test --admin-password admin123!
+# coupons (admin) – pass raw JSON for flexibility
+python store_cli.py --cookie-file admin.cookies coupons list
+python store_cli.py --cookie-file admin.cookies coupons create --json '{"code":"SAVE10","type":"PERCENT","value":10,"maxUses":100}'
+
+# admin orders / stats
+python store_cli.py --cookie-file admin.cookies admin orders list
+python store_cli.py --cookie-file admin.cookies admin orders get --id ORDER_ID
+python store_cli.py --cookie-file admin.cookies admin stats
+
+# account orders (customer)
+python store_cli.py --cookie-file user.cookies login --email user@local.test --password test12345
+python store_cli.py --cookie-file user.cookies account orders
+python store_cli.py --cookie-file user.cookies account order --id ORDER_ID
+
+# end-to-end demos
+python store_cli.py --cookie-file admin.cookies demo-admin
+python store_cli.py --cookie-file cart.cookies demo-storefront
 """
 
 import argparse
@@ -83,7 +98,7 @@ class ApiClient:
             if self.verbose:
                 print(f"[cookies] Failed to save cookie jar: {e}")
 
-    def request(self, method: str, path: str, *, params: Dict[str, Any] = None, json_body: Dict[str, Any] = None) -> Any:
+    def request(self, method: str, path: str, *, params: Dict[str, Any] = None, json_body: Any = None) -> Any:
         url = f"{self.base_url}{path}"
         headers = {"content-type": "application/json"} if json_body is not None else {}
         resp = self.sess.request(method, url, params=params, json=json_body, headers=headers, timeout=30)
@@ -97,27 +112,6 @@ class ApiClient:
             raise ApiError(f"HTTP {resp.status_code} for {method} {path}: {json.dumps(data, indent=2) if isinstance(data, dict) else data}")
         self._save_cookies()
         return data
-
-    def request_expect(self, method: str, path: str, expect, *, params=None, json_body=None):
-        """
-        Like request() but doesn't throw if status is in 'expect' (int or list of ints).
-        Returns (status_code, parsed_json_or_text)
-        """
-        url = f"{self.base_url}{path}"
-        headers = {"content-type": "application/json"} if json_body is not None else {}
-        resp = self.sess.request(method, url, params=params, json=json_body, headers=headers, timeout=30)
-        code = resp.status_code
-        if self.verbose:
-            print(f"[{method} {path}] {code}")
-        try:
-            data = resp.json()
-        except ValueError:
-            data = resp.text
-        ok_set = {expect} if isinstance(expect, int) else set(expect)
-        if code not in ok_set:
-            raise ApiError(f"HTTP {code} for {method} {path}: {json.dumps(data, indent=2) if isinstance(data, dict) else data}")
-        self._save_cookies()
-        return code, data
 
     # ---------- Auth ----------
     def register(self, email: str, password: str, name: str) -> Any:
@@ -169,7 +163,7 @@ class ApiClient:
         try:
             return self.create_brand(**payload)
         except ApiError as e:
-            if "409" in str(e) or "Conflict" in str(e) or "already exists" in str(e):
+            if "409" in str(e) or "Conflict" in str(e):
                 existing = self.find_brand(slug=slug, name=name)
                 if existing:
                     if self.verbose:
@@ -216,7 +210,7 @@ class ApiClient:
         try:
             return self.create_category(**payload)
         except ApiError as e:
-            if "409" in str(e) or "Conflict" in str(e) or "already exists" in str(e):
+            if "409" in str(e) or "Conflict" in str(e):
                 existing = self.find_category(slug=slug, name=name, parent_id=parentId)
                 if existing:
                     if self.verbose:
@@ -264,7 +258,7 @@ class ApiClient:
         try:
             return self.create_product(**payload)
         except ApiError as e:
-            if "409" in str(e) or "Slug already exists" in str(e) or "Conflict" in str(e) or "already exists" in str(e):
+            if "409" in str(e) or "Slug already exists" in str(e) or "Conflict" in str(e):
                 existing = self.find_product(slug=slug, title=title)
                 if existing:
                     if self.verbose:
@@ -377,6 +371,48 @@ class ApiClient:
             body["billingAddressId"] = billing_address_id
         return self.request("POST", "/api/checkout", json_body=body)
 
+    # ---------- Admin: coupons ----------
+    def admin_list_coupons(self, page: int = 1, page_size: int = 50, q: str = "") -> Any:
+        params = {"page": page, "pageSize": page_size}
+        if q:
+            params["q"] = q
+        return self.request("GET", "/api/admin/coupons", params=params)
+
+    def admin_create_coupon(self, payload: Dict[str, Any]) -> Any:
+        return self.request("POST", "/api/admin/coupons", json_body=payload)
+
+    def admin_update_coupon(self, coupon_id: str, payload: Dict[str, Any]) -> Any:
+        return self.request("PUT", f"/api/admin/coupons/{coupon_id}", json_body=payload)
+
+    def admin_delete_coupon(self, coupon_id: str) -> Any:
+        return self.request("DELETE", f"/api/admin/coupons/{coupon_id}")
+
+    # ---------- Admin: orders ----------
+    def admin_orders(self, page: int = 1, page_size: int = 50, status: Optional[str] = None, q: str = "") -> Any:
+        params = {"page": page, "pageSize": page_size}
+        if status:
+            params["status"] = status
+        if q:
+            params["q"] = q
+        return self.request("GET", "/api/admin/orders", params=params)
+
+    def admin_order_get(self, order_id: str) -> Any:
+        return self.request("GET", f"/api/admin/orders/{order_id}")
+
+    def admin_order_update(self, order_id: str, payload: Dict[str, Any]) -> Any:
+        return self.request("PUT", f"/api/admin/orders/{order_id}", json_body=payload)
+
+    # ---------- Admin: stats ----------
+    def admin_stats(self) -> Any:
+        return self.request("GET", "/api/admin/stats")
+
+    # ---------- Account: orders ----------
+    def account_orders(self) -> Any:
+        return self.request("GET", "/api/account/orders")
+
+    def account_order_get(self, order_id: str) -> Any:
+        return self.request("GET", f"/api/account/orders/{order_id}")
+
 
 def pretty(obj):
     print(json.dumps(obj, indent=2, ensure_ascii=False))
@@ -400,7 +436,7 @@ def act_logout(args):
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
     pretty(c.logout())
 
-
+# brands
 def act_brands(args):
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
     if args.action == "list":
@@ -423,7 +459,7 @@ def act_brands(args):
     elif args.action == "delete":
         pretty(c.delete_brand(args.id))
 
-
+# categories
 def act_categories(args):
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
     if args.action == "list":
@@ -445,7 +481,7 @@ def act_categories(args):
     elif args.action == "delete":
         pretty(c.delete_category(args.id))
 
-
+# products
 def act_products(args):
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
     if args.action == "list":
@@ -476,7 +512,7 @@ def act_products(args):
     elif args.action == "get":
         pretty(c.get_product(args.id))
 
-
+# options
 def act_options(args):
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
     if args.action == "list":
@@ -484,7 +520,7 @@ def act_options(args):
     elif args.action == "add":
         pretty(c.add_option(args.product_id, args.name, args.values, position=args.position))
 
-
+# variants (collection)
 def act_variants(args):
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
     if args.action == "list":
@@ -495,7 +531,7 @@ def act_variants(args):
         combos = [json.loads(s) for s in args.combo]
         pretty(c.create_combinations(args.product_id, combos, currency=args.currency))
 
-
+# single variant
 def act_variant(args):
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
     if args.action == "update":
@@ -512,7 +548,7 @@ def act_variant(args):
     elif args.action == "delete":
         pretty(c.delete_variant(args.variant_id))
 
-
+# stock
 def act_stock(args):
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
     if args.action == "set":
@@ -520,7 +556,7 @@ def act_stock(args):
     elif args.action == "delta":
         pretty(c.delta_stock(args.variant_id, delta=args.delta, reason=args.reason, warehouse_id=args.warehouse_id))
 
-
+# catalog
 def act_catalog(args):
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
     if args.section == "products":
@@ -532,7 +568,7 @@ def act_catalog(args):
     elif args.section == "categories":
         pretty(c.catalog_categories(parent=args.parent, page=args.page, page_size=args.page_size))
 
-
+# cart
 def act_cart(args):
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
     if args.action == "get":
@@ -550,12 +586,48 @@ def act_cart(args):
     elif args.action == "remove-coupon":
         pretty(c.cart_remove_coupon())
 
-
+# checkout
 def act_checkout(args):
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
     pretty(c.checkout(email=args.email, provider=args.provider, capture=not args.auth_only, shipping_address_id=args.shipping_address_id, billing_address_id=args.billing_address_id))
 
+# coupons (admin)
+def act_coupons(args):
+    c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
+    if args.action == "list":
+        pretty(c.admin_list_coupons(page=args.page, page_size=args.page_size, q=args.q or ""))
+    elif args.action == "create":
+        payload = json.loads(args.json)
+        pretty(c.admin_create_coupon(payload))
+    elif args.action == "update":
+        payload = json.loads(args.json)
+        pretty(c.admin_update_coupon(args.id, payload))
+    elif args.action == "delete":
+        pretty(c.admin_delete_coupon(args.id))
 
+# admin orders / stats
+def act_admin(args):
+    c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
+    if args.section == "orders":
+        if args.action == "list":
+            pretty(c.admin_orders(page=args.page, page_size=args.page_size, status=args.status, q=args.q or ""))
+        elif args.action == "get":
+            pretty(c.admin_order_get(args.id))
+        elif args.action == "update":
+            payload = json.loads(args.json)
+            pretty(c.admin_order_update(args.id, payload))
+    elif args.section == "stats":
+        pretty(c.admin_stats())
+
+# account (customer) orders
+def act_account(args):
+    c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
+    if args.section == "orders":
+        pretty(c.account_orders())
+    elif args.section == "order":
+        pretty(c.account_order_get(args.id))
+
+# demos
 def act_demo_admin(args):
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
     print(f"[demo-admin] Login as {args.email}")
@@ -604,7 +676,6 @@ def act_demo_admin(args):
         variants = c.list_variants(pid)
     print(f"[demo-admin] Variants: {len(variants) if isinstance(variants, list) else 0}")
 
-
 def act_demo_storefront(args):
     # Guest/cart flow using separate cookie jar typically
     c = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
@@ -618,16 +689,9 @@ def act_demo_storefront(args):
         print(f"\n[demo-storefront] PDP for {slug}")
         pdp = c.catalog_product(slug)
         pretty(pdp)
-        # pick default variant if available, else first
         variants = pdp.get("variants", [])
-        variant = None
-        for v in variants:
-            if v.get("isDefault"):
-                variant = v
-                break
-        variant = variant or (variants[0] if variants else None)
-        if variant:
-            vid = variant["id"]
+        if variants:
+            vid = variants[0]["id"]
             print(f"\n[demo-storefront] Add to cart variant {vid}")
             pretty(c.cart_add_item(vid, qty=2))
         else:
@@ -643,100 +707,6 @@ def act_demo_storefront(args):
     print("\n[demo-storefront] Checkout (manual provider) as guest")
     pretty(c.checkout(email=args.email))
 
-
-def act_smoke(args):
-    """Comprehensive smoke: catalog -> PDP -> guest cart -> over-qty (expect 400) -> login merge -> checkout
-       If admin creds provided, also reads stock levels before/after."""
-    user_client = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
-    admin_client = None
-    if args.admin_email and args.admin_password and args.admin_cookie_file:
-        admin_client = ApiClient(args.base_url, args.admin_cookie_file, verbose=not args.quiet)
-        print(f"[smoke] Admin login as {args.admin_email}")
-        try:
-            pretty(admin_client.login(args.admin_email, args.admin_password))
-        except ApiError as e:
-            print(f"[smoke] WARN: admin login failed: {e}")
-            admin_client = None
-
-    # 1) Catalog
-    cat = user_client.catalog_products(page=1, page_size=12, sort="newest")
-    if not isinstance(cat, dict) or not cat.get("items"):
-        print("[smoke] No published products; run demo-admin first.")
-        return
-
-    # 2) PDP
-    slug = args.slug or cat["items"][0]["slug"]
-    print(f"[smoke] PDP {slug}")
-    pdp = user_client.catalog_product(slug)
-    variants = pdp.get("variants", [])
-    if not variants:
-        print("[smoke] No variants on PDP"); return
-    variant = next((v for v in variants if v.get("isDefault")), variants[0])
-    vid = variant["id"]
-    sku = variant.get("sku")
-    print(f"[smoke] Variant {vid} ({sku})")
-
-    # helper to check stock via admin endpoint
-    def read_stock(pid, vid):
-        if not admin_client: return None
-        try:
-            arr = admin_client.list_variants(pid)
-        except ApiError:
-            return None
-        if not isinstance(arr, list): return None
-        for row in arr:
-            if row.get("id") == vid:
-                return row.get("stockLevels", [])
-        return None
-
-    # 3) pre-stock
-    pre = read_stock(pdp.get("id"), vid)
-    if pre is not None and not args.quiet:
-        print("[stock BEFORE]"); pretty(pre)
-
-    # 4) add to cart as guest
-    print(f"[smoke] Add to cart qty={args.qty}")
-    pretty(user_client.cart_add_item(vid, qty=args.qty))
-
-    # 5) show cart
-    print("[smoke] Cart")
-    pretty(user_client.cart_get())
-
-    # 6) exceed stock => expect 400
-    print("[smoke] Try exceeding stock (expect 400)")
-    try:
-        # use request_expect to not throw on 400
-        code, data = user_client.request_expect("POST", "/api/cart/items", [200, 400],
-                                                json_body={"variantId": vid, "quantity": 999999})
-        print(f"[exceed] status={code}")
-        pretty(data)
-    except ApiError as e:
-        print(f"[exceed] ERROR (unexpected): {e}")
-
-    # 7) login as customer (merge cart)
-    if args.user_email and args.user_password:
-        print(f"[smoke] User login {args.user_email}")
-        pretty(user_client.login(args.user_email, args.user_password))
-        print("[smoke] /me")
-        pretty(user_client.me())
-        print("[smoke] Cart after login (merged)")
-        pretty(user_client.cart_get())
-
-    # 8) reserved stock
-    mid = read_stock(pdp.get("id"), vid)
-    if mid is not None and not args.quiet:
-        print("[stock AFTER RESERVE]"); pretty(mid)
-
-    # 9) checkout
-    print("[smoke] Checkout")
-    pretty(user_client.checkout(email=args.checkout_email or args.user_email))
-
-    # 10) post
-    post = read_stock(pdp.get("id"), vid)
-    if post is not None and not args.quiet:
-        print("[stock AFTER CONSUME]"); pretty(post)
-
-    print("\n[smoke] DONE")
 
 # ---------------- Argparse ----------------
 
@@ -1008,10 +978,70 @@ def build_parser():
     chk = sub.add_parser("checkout", help="Checkout (manual)")
     chk.add_argument("--email", help="Required if not logged in")
     chk.add_argument("--provider", default="manual", choices=["manual"])
-    chk.add_argument("--auth-only", action="store_true", help="If set, do auth only (no capture) when provider supports it")
+    chk.add_argument("--auth-only", action="store_true", help="If set, do auth only (no capture)")
     chk.add_argument("--shipping-address-id")
     chk.add_argument("--billing-address-id")
     chk.set_defaults(func=act_checkout)
+
+    # coupons (admin)
+    cp = sub.add_parser("coupons", help="Admin coupons")
+    cps = cp.add_subparsers(dest="action", required=True)
+
+    cpl = cps.add_parser("list", help="List coupons")
+    cpl.add_argument("--q", default="")
+    cpl.add_argument("--page", type=int, default=1)
+    cpl.add_argument("--page-size", type=int, default=50)
+    cpl.set_defaults(func=act_coupons)
+
+    cpc = cps.add_parser("create", help="Create coupon (JSON payload)")
+    cpc.add_argument("--json", required=True, help='e.g. \'{"code":"SAVE10","type":"PERCENT","value":10}\'')
+    cpc.set_defaults(func=act_coupons)
+
+    cpu = cps.add_parser("update", help="Update coupon (JSON payload)")
+    cpu.add_argument("--id", required=True)
+    cpu.add_argument("--json", required=True)
+    cpu.set_defaults(func=act_coupons)
+
+    cpd = cps.add_parser("delete", help="Delete coupon")
+    cpd.add_argument("--id", required=True)
+    cpd.set_defaults(func=act_coupons)
+
+    # admin: orders + stats
+    adm = sub.add_parser("admin", help="Admin endpoints")
+    adms = adm.add_subparsers(dest="section", required=True)
+
+    ado = adms.add_parser("orders", help="Orders")
+    ados = ado.add_subparsers(dest="action", required=True)
+
+    adol = ados.add_parser("list", help="List orders")
+    adol.add_argument("--page", type=int, default=1)
+    adol.add_argument("--page-size", type=int, default=50)
+    adol.add_argument("--status", default=None)
+    adol.add_argument("--q", default="")
+    adol.set_defaults(func=act_admin)
+
+    adog = ados.add_parser("get", help="Get order")
+    adog.add_argument("--id", required=True)
+    adog.set_defaults(func=act_admin)
+
+    adou = ados.add_parser("update", help="Update order (JSON payload)")
+    adou.add_argument("--id", required=True)
+    adou.add_argument("--json", required=True)
+    adou.set_defaults(func=act_admin)
+
+    ads = adms.add_parser("stats", help="Admin stats (KPIs, time-series)")
+    ads.set_defaults(func=act_admin)
+
+    # account (customer)
+    acc = sub.add_parser("account", help="Customer account")
+    accs = acc.add_subparsers(dest="section", required=True)
+
+    acco = accs.add_parser("orders", help="List my orders")
+    acco.set_defaults(func=act_account)
+
+    accg = accs.add_parser("order", help="Get my order")
+    accg.add_argument("--id", required=True)
+    accg.set_defaults(func=act_account)
 
     # demos
     dma = sub.add_parser("demo-admin", help="Seed brand/cats/product/options/variants")
@@ -1022,18 +1052,6 @@ def build_parser():
     dms = sub.add_parser("demo-storefront", help="Browse catalog -> add to cart -> checkout as guest")
     dms.add_argument("--email", default="buyer@local.test")
     dms.set_defaults(func=act_demo_storefront)
-
-    # smoke (new)
-    smk = sub.add_parser("smoke", help="End-to-end smoke: catalog->PDP->cart->login merge->checkout (+optional stock checks)")
-    smk.add_argument("--slug", default="athletic-tee")
-    smk.add_argument("--qty", type=int, default=2)
-    smk.add_argument("--user-email", default="user@local.test")
-    smk.add_argument("--user-password", default="test12345")
-    smk.add_argument("--checkout-email", default=None, help="override guest checkout email; default uses --user-email")
-    smk.add_argument("--admin-cookie-file", default=None, help="to enable stock checks")
-    smk.add_argument("--admin-email", default=DEFAULT_ADMIN_EMAIL)
-    smk.add_argument("--admin-password", default=DEFAULT_ADMIN_PASSWORD)
-    smk.set_defaults(func=act_smoke)
 
     return p
 
