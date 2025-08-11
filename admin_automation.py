@@ -30,6 +30,11 @@ Quick samples:
   # end-to-end demos
   python store_cli.py --cookie-file admin.cookies demo-admin
   python store_cli.py --cookie-file cart.cookies demo-storefront
+
+  # full smoke flow (guest->reserve->login merge->checkout + optional stock checks)
+  python store_cli.py --cookie-file cart.cookies smoke --slug athletic-tee --qty 2 \
+    --user-email user@local.test --user-password test12345 \
+    --admin-cookie-file admin.cookies --admin-email admin@local.test --admin-password admin123!
 """
 
 import argparse
@@ -93,6 +98,27 @@ class ApiClient:
         self._save_cookies()
         return data
 
+    def request_expect(self, method: str, path: str, expect, *, params=None, json_body=None):
+        """
+        Like request() but doesn't throw if status is in 'expect' (int or list of ints).
+        Returns (status_code, parsed_json_or_text)
+        """
+        url = f"{self.base_url}{path}"
+        headers = {"content-type": "application/json"} if json_body is not None else {}
+        resp = self.sess.request(method, url, params=params, json=json_body, headers=headers, timeout=30)
+        code = resp.status_code
+        if self.verbose:
+            print(f"[{method} {path}] {code}")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = resp.text
+        ok_set = {expect} if isinstance(expect, int) else set(expect)
+        if code not in ok_set:
+            raise ApiError(f"HTTP {code} for {method} {path}: {json.dumps(data, indent=2) if isinstance(data, dict) else data}")
+        self._save_cookies()
+        return code, data
+
     # ---------- Auth ----------
     def register(self, email: str, password: str, name: str) -> Any:
         return self.request("POST", "/api/auth/register", json_body={"email": email, "password": password, "name": name})
@@ -143,7 +169,7 @@ class ApiClient:
         try:
             return self.create_brand(**payload)
         except ApiError as e:
-            if "409" in str(e) or "Conflict" in str(e):
+            if "409" in str(e) or "Conflict" in str(e) or "already exists" in str(e):
                 existing = self.find_brand(slug=slug, name=name)
                 if existing:
                     if self.verbose:
@@ -190,7 +216,7 @@ class ApiClient:
         try:
             return self.create_category(**payload)
         except ApiError as e:
-            if "409" in str(e) or "Conflict" in str(e):
+            if "409" in str(e) or "Conflict" in str(e) or "already exists" in str(e):
                 existing = self.find_category(slug=slug, name=name, parent_id=parentId)
                 if existing:
                     if self.verbose:
@@ -238,7 +264,7 @@ class ApiClient:
         try:
             return self.create_product(**payload)
         except ApiError as e:
-            if "409" in str(e) or "Slug already exists" in str(e) or "Conflict" in str(e):
+            if "409" in str(e) or "Slug already exists" in str(e) or "Conflict" in str(e) or "already exists" in str(e):
                 existing = self.find_product(slug=slug, title=title)
                 if existing:
                     if self.verbose:
@@ -547,7 +573,16 @@ def act_demo_admin(args):
     pretty({"women": women["id"], "tops": tops["id"]})
 
     print("\n[demo-admin] Ensure product Athletic Tee")
-    prod = c.ensure_product(title="Athletic Tee", slug="athletic-tee", description="Breathable tee", status="PUBLISHED", skuPrefix="TEE", images=[{"url": "https://picsum.photos/seed/athtee/800/800"}], brandId=brand_id, categoryIds=[tops["id"]])
+    prod = c.ensure_product(
+        title="Athletic Tee",
+        slug="athletic-tee",
+        description="Breathable tee",
+        status="PUBLISHED",
+        skuPrefix="TEE",
+        images=[{"url": "https://picsum.photos/seed/athtee/800/800"}],
+        brandId=brand_id,
+        categoryIds=[tops["id"]],
+    )
     pretty(prod)
 
     pid = prod["id"]
@@ -583,10 +618,16 @@ def act_demo_storefront(args):
         print(f"\n[demo-storefront] PDP for {slug}")
         pdp = c.catalog_product(slug)
         pretty(pdp)
-        # pick first variant
+        # pick default variant if available, else first
         variants = pdp.get("variants", [])
-        if variants:
-            vid = variants[0]["id"]
+        variant = None
+        for v in variants:
+            if v.get("isDefault"):
+                variant = v
+                break
+        variant = variant or (variants[0] if variants else None)
+        if variant:
+            vid = variant["id"]
             print(f"\n[demo-storefront] Add to cart variant {vid}")
             pretty(c.cart_add_item(vid, qty=2))
         else:
@@ -602,6 +643,100 @@ def act_demo_storefront(args):
     print("\n[demo-storefront] Checkout (manual provider) as guest")
     pretty(c.checkout(email=args.email))
 
+
+def act_smoke(args):
+    """Comprehensive smoke: catalog -> PDP -> guest cart -> over-qty (expect 400) -> login merge -> checkout
+       If admin creds provided, also reads stock levels before/after."""
+    user_client = ApiClient(args.base_url, args.cookie_file, verbose=not args.quiet)
+    admin_client = None
+    if args.admin_email and args.admin_password and args.admin_cookie_file:
+        admin_client = ApiClient(args.base_url, args.admin_cookie_file, verbose=not args.quiet)
+        print(f"[smoke] Admin login as {args.admin_email}")
+        try:
+            pretty(admin_client.login(args.admin_email, args.admin_password))
+        except ApiError as e:
+            print(f"[smoke] WARN: admin login failed: {e}")
+            admin_client = None
+
+    # 1) Catalog
+    cat = user_client.catalog_products(page=1, page_size=12, sort="newest")
+    if not isinstance(cat, dict) or not cat.get("items"):
+        print("[smoke] No published products; run demo-admin first.")
+        return
+
+    # 2) PDP
+    slug = args.slug or cat["items"][0]["slug"]
+    print(f"[smoke] PDP {slug}")
+    pdp = user_client.catalog_product(slug)
+    variants = pdp.get("variants", [])
+    if not variants:
+        print("[smoke] No variants on PDP"); return
+    variant = next((v for v in variants if v.get("isDefault")), variants[0])
+    vid = variant["id"]
+    sku = variant.get("sku")
+    print(f"[smoke] Variant {vid} ({sku})")
+
+    # helper to check stock via admin endpoint
+    def read_stock(pid, vid):
+        if not admin_client: return None
+        try:
+            arr = admin_client.list_variants(pid)
+        except ApiError:
+            return None
+        if not isinstance(arr, list): return None
+        for row in arr:
+            if row.get("id") == vid:
+                return row.get("stockLevels", [])
+        return None
+
+    # 3) pre-stock
+    pre = read_stock(pdp.get("id"), vid)
+    if pre is not None and not args.quiet:
+        print("[stock BEFORE]"); pretty(pre)
+
+    # 4) add to cart as guest
+    print(f"[smoke] Add to cart qty={args.qty}")
+    pretty(user_client.cart_add_item(vid, qty=args.qty))
+
+    # 5) show cart
+    print("[smoke] Cart")
+    pretty(user_client.cart_get())
+
+    # 6) exceed stock => expect 400
+    print("[smoke] Try exceeding stock (expect 400)")
+    try:
+        # use request_expect to not throw on 400
+        code, data = user_client.request_expect("POST", "/api/cart/items", [200, 400],
+                                                json_body={"variantId": vid, "quantity": 999999})
+        print(f"[exceed] status={code}")
+        pretty(data)
+    except ApiError as e:
+        print(f"[exceed] ERROR (unexpected): {e}")
+
+    # 7) login as customer (merge cart)
+    if args.user_email and args.user_password:
+        print(f"[smoke] User login {args.user_email}")
+        pretty(user_client.login(args.user_email, args.user_password))
+        print("[smoke] /me")
+        pretty(user_client.me())
+        print("[smoke] Cart after login (merged)")
+        pretty(user_client.cart_get())
+
+    # 8) reserved stock
+    mid = read_stock(pdp.get("id"), vid)
+    if mid is not None and not args.quiet:
+        print("[stock AFTER RESERVE]"); pretty(mid)
+
+    # 9) checkout
+    print("[smoke] Checkout")
+    pretty(user_client.checkout(email=args.checkout_email or args.user_email))
+
+    # 10) post
+    post = read_stock(pdp.get("id"), vid)
+    if post is not None and not args.quiet:
+        print("[stock AFTER CONSUME]"); pretty(post)
+
+    print("\n[smoke] DONE")
 
 # ---------------- Argparse ----------------
 
@@ -887,6 +1022,18 @@ def build_parser():
     dms = sub.add_parser("demo-storefront", help="Browse catalog -> add to cart -> checkout as guest")
     dms.add_argument("--email", default="buyer@local.test")
     dms.set_defaults(func=act_demo_storefront)
+
+    # smoke (new)
+    smk = sub.add_parser("smoke", help="End-to-end smoke: catalog->PDP->cart->login merge->checkout (+optional stock checks)")
+    smk.add_argument("--slug", default="athletic-tee")
+    smk.add_argument("--qty", type=int, default=2)
+    smk.add_argument("--user-email", default="user@local.test")
+    smk.add_argument("--user-password", default="test12345")
+    smk.add_argument("--checkout-email", default=None, help="override guest checkout email; default uses --user-email")
+    smk.add_argument("--admin-cookie-file", default=None, help="to enable stock checks")
+    smk.add_argument("--admin-email", default=DEFAULT_ADMIN_EMAIL)
+    smk.add_argument("--admin-password", default=DEFAULT_ADMIN_PASSWORD)
+    smk.set_defaults(func=act_smoke)
 
     return p
 
