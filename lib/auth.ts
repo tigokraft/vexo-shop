@@ -77,3 +77,9 @@ export function requireRole(user: User | null, roles: UserRole[]) {
   if (!user) throw new Error('unauthenticated');
   if (!roles.includes(user.role)) throw new Error('forbidden');
 }
+
+export function requireAdmin(
+  user: Awaited<ReturnType<typeof getCurrentUser>>
+) {
+  return requireRole(user, 'ADMIN');
+}
