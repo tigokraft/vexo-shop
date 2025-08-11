@@ -5,6 +5,7 @@ import { NextResponse } from 'next/server';
 import { createHash, randomBytes } from 'crypto';
 import { cookies, headers } from 'next/headers';
 import type { User, UserRole } from '@prisma/client';
+import { unauthorized, forbidden } from '@/lib/http';
 
 const COOKIE_NAME = process.env.SESSION_COOKIE_NAME ?? 'auth_session';
 const SESSION_SECRET = process.env.SESSION_SECRET ?? 'dev-secret-change-me';
@@ -73,13 +74,25 @@ export async function getCurrentUser() {
   return session?.user ?? null;
 }
 
-export function requireRole(user: User | null, roles: UserRole[]) {
-  if (!user) throw new Error('unauthenticated');
-  if (!roles.includes(user.role)) throw new Error('forbidden');
+export function requireRole(
+  user: User | null,
+  roles: UserRole | UserRole[]
+) {
+  const allowed = Array.isArray(roles) ? roles : [roles];
+
+  if (!user) return unauthorized('Not authenticated');
+  if (!allowed.includes(user.role)) return forbidden('Forbidden');
+
+  return null; // OK
 }
 
 export function requireAdmin(
   user: Awaited<ReturnType<typeof getCurrentUser>>
 ) {
   return requireRole(user, 'ADMIN');
+}
+
+export function requireUser(user: User | null) {
+  if (!user) return unauthorized('Login required');
+  return null;
 }
